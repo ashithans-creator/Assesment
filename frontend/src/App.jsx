@@ -540,7 +540,7 @@ function App() {
 
       // Save the complete conversation once at the end
       const finalMessages = [...updatedMessages, { role: 'assistant', content: assistantText }];
-      saveChat(finalMessages, mode);
+      saveChat(finalMessages);
     } catch (err) {
       console.error(err);
       setError(err.message || 'Chat request failed.');
