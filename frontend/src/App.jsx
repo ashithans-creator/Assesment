@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import * as XLSX from 'xlsx';
 import './App.css';
 
@@ -9,23 +9,18 @@ const initialMessages = [
   }
 ];
 
-const modeOptions = [
-  { value: 'qa', label: 'Question Answering' },
-  { value: 'test', label: 'Test Case Generation' }
-];
+
 
 const providerOptions = [
   { value: 'ollama', label: 'Ollama (Local)', models: ['phi3:latest', 'mistral', 'llama3'] },
   { value: 'openai', label: 'OpenAI', models: ['gpt-4', 'gpt-3.5-turbo'] },
   { value: 'gemini', label: 'Gemini', models: ['gemini-pro', 'gemini-pro-vision'] },
-  { value: 'groq', label: 'Groq', models: ['groq-gpt-1.5', 'groq-gpt-2'] },
-  { value: 'jira', label: 'Jira', models: ['jira'] }
+  { value: 'groq', label: 'Groq', models: ['groq-gpt-1.5', 'groq-gpt-2'] }
 ];
 
 function App() {
   const [messages, setMessages] = useState(initialMessages);
   const [input, setInput] = useState('');
-  const [mode, setMode] = useState('qa');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [chats, setChats] = useState([]);
@@ -50,8 +45,8 @@ function App() {
   const [jiraTestCases, setJiraTestCases] = useState('');
   const [jiraFetching, setJiraFetching] = useState(false);
   const [jiraGenerating, setJiraGenerating] = useState(false);
+  const [activeIntegration, setActiveIntegration] = useState('none');
   const [jiraError, setJiraError] = useState('');
-  
   const [defectSummary, setDefectSummary] = useState('');
   const [defectSteps, setDefectSteps] = useState('');
   const [defectExpectedResult, setDefectExpectedResult] = useState('');
@@ -65,6 +60,9 @@ function App() {
   const [defectProjectKey, setDefectProjectKey] = useState('PROJ');
   const [defectIssueType, setDefectIssueType] = useState('Bug');
   const [defectContext, setDefectContext] = useState('');
+  const [attachedFile, setAttachedFile] = useState(null);
+  const [attachedText, setAttachedText] = useState('');
+  const fileInputRef = useRef(null);
 
   useEffect(() => {
     try {
@@ -75,7 +73,6 @@ function App() {
         setChats(parsed);
         setCurrentChatId(parsed[0].id);
         setMessages(parsed[0].messages);
-        setMode(parsed[0].mode || 'qa');
       }
     } catch (err) {
       console.warn('Unable to load chat history', err);
@@ -88,10 +85,18 @@ function App() {
       if (savedSettings) {
         setSettings(JSON.parse(savedSettings));
       }
+      const savedIntegration = window.localStorage.getItem('qaAssistantIntegration');
+      if (savedIntegration) {
+        setActiveIntegration(savedIntegration);
+      }
     } catch (err) {
       console.warn('Unable to load settings', err);
     }
   }, []);
+
+  useEffect(() => {
+    window.localStorage.setItem('qaAssistantIntegration', activeIntegration);
+  }, [activeIntegration]);
 
   useEffect(() => {
     const providerData = providerOptions.find(p => p.value === settings.provider);
@@ -126,7 +131,7 @@ function App() {
     return trimmed.length > 40 ? `${trimmed.slice(0, 40)}...` : trimmed;
   };
 
-  const saveChat = (messageList, selectedMode) => {
+  const saveChat = (messageList) => {
     const title = buildTitle(messageList);
     const timestamp = Date.now();
 
@@ -134,7 +139,7 @@ function App() {
       setChats((prev) => {
         const updated = prev.map((chat) =>
           chat.id === currentChatId
-            ? { ...chat, messages: messageList, mode: selectedMode, title, updatedAt: timestamp }
+            ? { ...chat, messages: messageList, title, updatedAt: timestamp }
             : chat
         );
         const active = updated.find((chat) => chat.id === currentChatId);
@@ -146,7 +151,6 @@ function App() {
     const newChat = {
       id: String(timestamp),
       title,
-      mode: selectedMode,
       messages: messageList,
       createdAt: timestamp,
       updatedAt: timestamp
@@ -160,7 +164,6 @@ function App() {
     if (!selected) return;
     setCurrentChatId(id);
     setMessages(selected.messages);
-    setMode(selected.mode || 'qa');
     setError('');
   };
 
@@ -424,37 +427,71 @@ function App() {
     }
   };
 
+  const handleFileUpload = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    setLoading(true);
+    setError('');
+    const formData = new FormData();
+    formData.append('file', file);
+
+    try {
+      const response = await fetch('http://localhost:4000/api/upload', {
+        method: 'POST',
+        body: formData
+      });
+
+      if (!response.ok) {
+        throw new Error('Failed to upload file');
+      }
+
+      const data = await response.json();
+      setAttachedFile(file);
+      setAttachedText(data.text);
+    } catch (err) {
+      console.error(err);
+      setError('Error uploading file: ' + err.message);
+    } finally {
+      setLoading(false);
+      // Reset input value so same file can be uploaded again if needed
+      e.target.value = '';
+    }
+  };
+
   const sendMessage = async (event) => {
     event.preventDefault();
     const trimmed = input.trim();
-    if (!trimmed) return;
+    if (!trimmed && !attachedText) return;
 
-    const userMessage = { role: 'user', content: trimmed };
+    let finalContent = trimmed;
+    if (attachedText) {
+      finalContent = `Requirement Document Content:\n---\n${attachedText}\n---\n\nUser Question: ${trimmed || 'Please analyze this document and generate test cases.'}`;
+    }
+
+    const userMessage = { role: 'user', content: trimmed || 'File attached' };
     const updatedMessages = [...messages, userMessage];
+    
+    // We send the full context (with doc content) to the AI, but only show the user's text in UI
+    const apiMessages = [...messages, { role: 'user', content: finalContent }];
+
     setMessages(updatedMessages);
     setInput('');
+    setAttachedFile(null);
+    setAttachedText('');
     setError('');
     setLoading(true);
 
     try {
-      const requestProvider = getRequestProvider();
-      const requestModel = getRequestModel(requestProvider);
-
-      const requestApiKey =
-        requestProvider === 'openai'
-          ? settings.openaiKey
-          : requestProvider === 'gemini'
-          ? settings.geminiKey
-          : requestProvider === 'groq'
-          ? settings.groqKey
-          : undefined;
+      const requestProvider = settings.provider;
+      const requestModel = settings.provider === 'openai' ? settings.openaiModel : settings.provider === 'ollama' ? settings.ollamaModel : settings.model;
+      const requestApiKey = requestProvider === 'openai' ? settings.openaiKey : requestProvider === 'gemini' ? settings.geminiKey : requestProvider === 'groq' ? settings.groqKey : undefined;
 
       const response = await fetch('http://localhost:4000/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          messages: updatedMessages,
-          mode,
+          messages: apiMessages,
           provider: requestProvider,
           apiKey: requestApiKey,
           model: requestModel
@@ -512,7 +549,7 @@ function App() {
     }
   };
 
-  const activeMode = modeOptions.find((option) => option.value === mode)?.label;
+
 
   return (
     <div className="app-shell">
@@ -549,7 +586,6 @@ function App() {
                   onClick={() => handleSelectChat(chat.id)}
                 >
                   <div>{chat.title}</div>
-                  <span>{chat.mode === 'qa' ? 'QA' : chat.mode === 'test' ? 'Test' : 'Defect'}</span>
                 </button>
               ))
             )}
@@ -568,17 +604,17 @@ function App() {
           </div>
           <div className="header-controls">
             <button className="settings-btn" onClick={() => setShowSettings(true)}>Settings</button>
-            <select value={mode} onChange={(e) => setMode(e.target.value)}>
-              {modeOptions.map((option) => (
-                <option key={option.value} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
+            <div className="control-group">
+              <label>Integration:</label>
+              <select value={activeIntegration} onChange={(e) => setActiveIntegration(e.target.value)}>
+                <option value="none">None</option>
+                <option value="jira">Jira</option>
+              </select>
+            </div>
           </div>
         </div>
 
-        {settings.provider === 'jira' ? (
+        {activeIntegration === 'jira' ? (
           <div className="jira-panel">
             <div className="jira-top">
               <input
@@ -758,8 +794,30 @@ function App() {
               />
 
               <div className="composer-footer">
-                <div className="hint">Tip: Use QA mode, Test Case, or Defect Report in the top-right selector.</div>
-                <button type="submit" disabled={loading || !input.trim()}>
+                <div className="composer-actions">
+                  <button 
+                    type="button" 
+                    className="attach-btn" 
+                    onClick={() => fileInputRef.current?.click()}
+                    title="Upload Requirement Document"
+                  >
+                    📎
+                  </button>
+                  <input 
+                    type="file" 
+                    ref={fileInputRef} 
+                    style={{ display: 'none' }} 
+                    accept=".pdf,.txt,.md,.doc,.docx"
+                    onChange={handleFileUpload}
+                  />
+                  {attachedFile && (
+                    <div className="file-chip">
+                      <span>{attachedFile.name}</span>
+                      <button type="button" onClick={() => { setAttachedFile(null); setAttachedText(''); }}>×</button>
+                    </div>
+                  )}
+                </div>
+                <button type="submit" disabled={loading || (!input.trim() && !attachedText)}>
                   {loading ? 'Streaming…' : 'Send'}
                 </button>
               </div>
@@ -848,193 +906,37 @@ function App() {
                   />
                 </label>
               )}
-              {settings.provider === 'jira' && (
-                <div className="setting-group">
-                  <h3>Jira Configuration</h3>
-                  <label>
-                    AI Provider for Jira:
-                    <select
-                      value={settings.jiraLLMProvider || 'groq'}
-                      onChange={(e) => handleSettingsChange('jiraLLMProvider', e.target.value)}
-                    >
-                      <option value="ollama">Ollama</option>
-                      <option value="openai">OpenAI</option>
-                      <option value="gemini">Gemini</option>
-                      <option value="groq">Groq</option>
-                    </select>
-                  </label>
-                  {settings.jiraLLMProvider === 'openai' && (
-                    <label>
-                      OpenAI API Key:
-                      <input
-                        type="password"
-                        value={settings.openaiKey}
-                        onChange={(e) => handleSettingsChange('openaiKey', e.target.value)}
-                        placeholder="Enter OpenAI API key"
-                      />
-                    </label>
-                  )}
-                  {settings.jiraLLMProvider === 'gemini' && (
-                    <label>
-                      Gemini API Key:
-                      <input
-                        type="password"
-                        value={settings.geminiKey}
-                        onChange={(e) => handleSettingsChange('geminiKey', e.target.value)}
-                        placeholder="Enter Gemini API key"
-                      />
-                    </label>
-                  )}
-                  {settings.jiraLLMProvider === 'groq' && (
-                    <>
-                      <label>
-                        Groq API Key:
-                        <input
-                          type="password"
-                          value={settings.groqKey}
-                          onChange={(e) => handleSettingsChange('groqKey', e.target.value)}
-                          placeholder="Enter Groq API key"
-                        />
-                      </label>
-                      <label>
-                        Groq Model:
-                        <select
-                          value={settings.jiraLLMModel}
-                          onChange={(e) => handleSettingsChange('jiraLLMModel', e.target.value)}
-                        >
-                          {providerOptions.find(p => p.value === 'groq')?.models.map((model) => (
-                            <option key={model} value={model}>
-                              {model}
-                            </option>
-                          ))}
-                        </select>
-                      </label>
-                    </>
-                  )}
-                  {settings.jiraLLMProvider === 'openai' && (
-                    <>
-                      <label>
-                        OpenAI API Key:
-                        <input
-                          type="password"
-                          value={settings.openaiKey}
-                          onChange={(e) => handleSettingsChange('openaiKey', e.target.value)}
-                          placeholder="Enter OpenAI API key"
-                        />
-                      </label>
-                      <label>
-                        OpenAI Model:
-                        <select
-                          value={settings.jiraLLMModel}
-                          onChange={(e) => handleSettingsChange('jiraLLMModel', e.target.value)}
-                        >
-                          {providerOptions.find(p => p.value === 'openai')?.models.map((model) => (
-                            <option key={model} value={model}>
-                              {model}
-                            </option>
-                          ))}
-                        </select>
-                      </label>
-                    </>
-                  )}
-                  {settings.jiraLLMProvider === 'gemini' && (
-                    <>
-                      <label>
-                        Gemini API Key:
-                        <input
-                          type="password"
-                          value={settings.geminiKey}
-                          onChange={(e) => handleSettingsChange('geminiKey', e.target.value)}
-                          placeholder="Enter Gemini API key"
-                        />
-                      </label>
-                      <label>
-                        Gemini Model:
-                        <select
-                          value={settings.jiraLLMModel}
-                          onChange={(e) => handleSettingsChange('jiraLLMModel', e.target.value)}
-                        >
-                          {providerOptions.find(p => p.value === 'gemini')?.models.map((model) => (
-                            <option key={model} value={model}>
-                              {model}
-                            </option>
-                          ))}
-                        </select>
-                      </label>
-                    </>
-                  )}
-                  {settings.jiraLLMProvider === 'groq' && (
-                    <>
-                      <label>
-                        Groq API Key:
-                        <input
-                          type="password"
-                          value={settings.groqKey}
-                          onChange={(e) => handleSettingsChange('groqKey', e.target.value)}
-                          placeholder="Enter Groq API key"
-                        />
-                      </label>
-                      <label>
-                        Groq Model:
-                        <select
-                          value={settings.jiraLLMModel}
-                          onChange={(e) => handleSettingsChange('jiraLLMModel', e.target.value)}
-                        >
-                          {providerOptions.find(p => p.value === 'groq')?.models.map((model) => (
-                            <option key={model} value={model}>
-                              {model}
-                            </option>
-                          ))}
-                        </select>
-                      </label>
-                    </>
-                  )}
-                  {settings.jiraLLMProvider === 'ollama' && (
-                    <>
-                      <label>
-                        Ollama Model:
-                        <select
-                          value={settings.jiraLLMModel}
-                          onChange={(e) => handleSettingsChange('jiraLLMModel', e.target.value)}
-                        >
-                          {providerOptions.find(p => p.value === 'ollama')?.models.map((model) => (
-                            <option key={model} value={model}>
-                              {model}
-                            </option>
-                          ))}
-                        </select>
-                      </label>
-                    </>
-                  )}
-                  <label>
-                    Jira Domain:
-                    <input
-                      type="text"
-                      value={settings.jiraDomain}
-                      onChange={(e) => handleSettingsChange('jiraDomain', e.target.value)}
-                      placeholder="yourcompany or yourcompany.atlassian.net"
-                    />
-                  </label>
-                  <label>
-                    Jira Email:
-                    <input
-                      type="email"
-                      value={settings.jiraEmail}
-                      onChange={(e) => handleSettingsChange('jiraEmail', e.target.value)}
-                      placeholder="you@example.com"
-                    />
-                  </label>
-                  <label>
-                    Jira API Token:
-                    <input
-                      type="password"
-                      value={settings.jiraToken}
-                      onChange={(e) => handleSettingsChange('jiraToken', e.target.value)}
-                      placeholder="Jira API token"
-                    />
-                  </label>
-                </div>
-              )}
+              <div className="setting-group jira-settings">
+                <h3>Jira Integration</h3>
+                <label>
+                  Jira Domain:
+                  <input
+                    type="text"
+                    value={settings.jiraDomain}
+                    onChange={(e) => handleSettingsChange('jiraDomain', e.target.value)}
+                    placeholder="example.atlassian.net"
+                  />
+                </label>
+                <label>
+                  Jira Email:
+                  <input
+                    type="text"
+                    value={settings.jiraEmail}
+                    onChange={(e) => handleSettingsChange('jiraEmail', e.target.value)}
+                    placeholder="email@example.com"
+                  />
+                </label>
+                <label>
+                  Jira API Token:
+                  <input
+                    type="password"
+                    value={settings.jiraToken}
+                    onChange={(e) => handleSettingsChange('jiraToken', e.target.value)}
+                    placeholder="Enter Jira API token"
+                  />
+                </label>
+              </div>
+                
               <div className="settings-actions">
                 <button onClick={handleSaveSettings}>Save</button>
                 <button onClick={() => setShowSettings(false)}>Cancel</button>
